@@ -1,0 +1,38 @@
+
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# Airflow
+src/airflow/logs/
+src/airflow/__pycache__/
+
+# Generated data
+data/
+*.parquet
+*.csv
+*.jsonl
+
+# Spark
+metastore_db/
+spark-warehouse/
+
+# IDE
+.idea/
+.vscode/
+.DS_Store
+
+# Logs
+*.log
+
+# OS
+.DS_Store

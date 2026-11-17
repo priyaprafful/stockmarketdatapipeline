@@ -1,0 +1,261 @@
+x-airflow-common: &airflow-common
+  image: apache/airflow:3.4.0
+  platform: linux/amd64
+  env_file:
+    - .env
+  environment: &airflow-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-airflow}:${POSTGRES_PASSWORD:-change-me-postgres}@postgres:5432/${POSTGRES_DB:-airflow}
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__SCHEDULER__MIN_FILE_PROCESS_INTERVAL: "10"
+    AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+    AIRFLOW__WEBSERVER__SECRET_KEY: "${AIRFLOW_WEBSERVER_SECRET_KEY:-replace-with-a-long-random-secret}"
+    AIRFLOW__CORE__FERNET_KEY: "${AIRFLOW_FERNET_KEY:-}"
+    PYTHONPATH: /opt/project:/opt/project/src
+    _PIP_ADDITIONAL_REQUIREMENTS: "${_PIP_ADDITIONAL_REQUIREMENTS:-apache-airflow-providers-fab apache-airflow-providers-postgres apache-airflow-providers-apache-spark confluent-kafka yfinance pandas boto3 snowflake-connector-python minio}"
+  volumes:
+    - ./src/airflow/dags:/opt/airflow/dags
+    - ./src/airflow/logs:/opt/airflow/logs
+    - ./src/airflow/plugins:/opt/airflow/plugins
+    - ./src/airflow/reports:/opt/airflow/reports
+    - ./src/airflow/requirements:/opt/airflow/requirements
+    - ./src:/opt/project/src
+    - ./data:/opt/project/data
+    - ./requirement.txt:/opt/project/requirement.txt:ro
+  depends_on:
+    postgres:
+      condition: service_healthy
+  restart: unless-stopped
+
+services:
+  postgres:
+    image: postgres:18
+    platform: linux/amd64
+    container_name: stockmarket-postgres
+    environment:
+      POSTGRES_USER: "${POSTGRES_USER:-airflow}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-change-me-postgres}"
+      POSTGRES_DB: "${POSTGRES_DB:-airflow}"
+    ports:
+      - "127.0.0.1:5433:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+    restart: unless-stopped
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.9.11
+    platform: linux/amd64
+    container_name: stockmarket-zookeeper
+    hostname: zookeeper
+    ports:
+      - "127.0.0.1:2181:2181"
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    volumes:
+      - ./data/zookeeper/data:/var/lib/zookeeper/data
+      - ./data/zookeeper/log:/var/lib/zookeeper/log
+    healthcheck:
+      test: ["CMD", "cub", "zk-ready", "localhost", "2181"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
+    restart: unless-stopped
+
+  kafka:
+    image: confluentinc/cp-kafka:7.9.11
+    platform: linux/amd64
+    container_name: stockmarket-kafka
+    hostname: kafka
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:29092:29092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,PLAINTEXT_HOST://0.0.0.0:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+    volumes:
+      - ./data/kafka:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD", "cub", "kafka-ready", "-b", "localhost:9092", "1", "20"]
+      interval: 15s
+      timeout: 15s
+      retries: 12
+    restart: unless-stopped
+
+  # S3-compatible object storage. Service name "minio" preserves the
+  # endpoint expected by code that uses http://minio:9000.
+  minio:
+    image: rustfs/rustfs:latest
+    platform: linux/amd64
+    container_name: stockmarket-object-storage
+    environment:
+      RUSTFS_VOLUMES: /data
+      RUSTFS_ADDRESS: ":9000"
+      RUSTFS_CONSOLE_ADDRESS: ":9001"
+      RUSTFS_ACCESS_KEY: "${MINIO_ROOT_USER:-stockmarketadmin}"
+      RUSTFS_SECRET_KEY: "${MINIO_ROOT_PASSWORD:-change-this-storage-password}"
+    ports:
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+    volumes:
+      - rustfs-data:/data
+    command: ["/data"]
+    restart: unless-stopped
+
+  spark-master:
+    image: apache/spark:3.5.9
+    platform: linux/amd64
+    container_name: stockmarket-spark-master
+    hostname: spark-master
+    ports:
+      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:7077:7077"
+    volumes:
+      - ./src/spark/jobs:/opt/spark/jobs
+      - ./src:/opt/project/src
+      - ./data:/opt/project/data
+      - ./data/jars:/opt/spark/extra-jars
+    command:
+      - /opt/spark/bin/spark-class
+      - org.apache.spark.deploy.master.Master
+      - --host
+      - spark-master
+      - --port
+      - "7077"
+      - --webui-port
+      - "8080"
+    restart: unless-stopped
+
+  spark-worker:
+    image: apache/spark:3.5.9
+    platform: linux/amd64
+    container_name: stockmarket-spark-worker
+    hostname: spark-worker
+    depends_on:
+      - spark-master
+    ports:
+      - "127.0.0.1:8082:8081"
+    volumes:
+      - ./src/spark/jobs:/opt/spark/jobs
+      - ./src:/opt/project/src
+      - ./data:/opt/project/data
+      - ./data/jars:/opt/spark/extra-jars
+    command:
+      - /opt/spark/bin/spark-class
+      - org.apache.spark.deploy.worker.Worker
+      - spark://spark-master:7077
+      - --host
+      - spark-worker
+      - --port
+      - "7078"
+      - --webui-port
+      - "8081"
+      - --cores
+      - "2"
+      - --memory
+      - "1g"
+    restart: unless-stopped
+
+  spark-client:
+    image: apache/spark:3.5.9
+    platform: linux/amd64
+    container_name: stockmarket-spark-client
+    depends_on:
+      - spark-master
+    env_file:
+      - .env
+    environment:
+      PYTHONPATH: /opt/project:/opt/project/src
+      SPARK_MASTER: spark://spark-master:7077
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      S3_ENDPOINT_URL: http://minio:9000
+      AWS_ACCESS_KEY_ID: "${MINIO_ROOT_USER:-stockmarketadmin}"
+      AWS_SECRET_ACCESS_KEY: "${MINIO_ROOT_PASSWORD:-change-this-storage-password}"
+    volumes:
+      - ./src/spark/jobs:/opt/spark/jobs
+      - ./src:/opt/project/src
+      - ./data:/opt/project/data
+      - ./data/jars:/opt/spark/extra-jars
+      - ./requirement.txt:/opt/project/requirement.txt:ro
+    entrypoint: ["/bin/bash", "-lc"]
+    command: ["sleep infinity"]
+    restart: unless-stopped
+
+  airflow-init:
+    <<: *airflow-common
+    container_name: stockmarket-airflow-init
+    restart: "no"
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate
+        airflow users create \
+          --username "$${AIRFLOW_ADMIN_USERNAME:-airflow}" \
+          --password "$${AIRFLOW_ADMIN_PASSWORD:-change-this-airflow-password}" \
+          --firstname StockMarket \
+          --lastname Admin \
+          --role Admin \
+          --email "$${AIRFLOW_ADMIN_EMAIL:-airflow@example.com}" \
+          || true
+
+  airflow-api-server:
+    <<: *airflow-common
+    container_name: stockmarket-airflow-api-server
+    command: api-server
+    ports:
+      - "127.0.0.1:8081:8080"
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "curl --fail http://localhost:8080/api/v2/monitor/health"]
+      interval: 20s
+      timeout: 10s
+      retries: 10
+      start_period: 45s
+
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: stockmarket-airflow-scheduler
+    command: scheduler
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-dag-processor:
+    <<: *airflow-common
+    container_name: stockmarket-airflow-dag-processor
+    command: dag-processor
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-triggerer:
+    <<: *airflow-common
+    container_name: stockmarket-airflow-triggerer
+    command: triggerer
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+volumes:
+  postgres-data:
+  rustfs-data:
